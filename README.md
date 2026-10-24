@@ -12,32 +12,42 @@ Read [`problem_statement.md`](./problem_statement.md) for the complete challenge
 
 ---
 
-## Quick Start
+## Quick Start & Reproduction
 
-Clone the repository and move into the project directory:
+### Prerequisites
+- Python 3.10+ (Standard library only; zero external pip dependencies required).
 
-```bash
-git clone https://github.com/interviewstreet/hackerrank-orchestrate-october26.git
-cd hackerrank-orchestrate-october26
-```
-
-Start your AI coding tool from the **repository root** so it automatically reads [`AGENTS.md`](./AGENTS.md) and logs your session turns to `log.txt` in the root directory.
-
-Build your solution in `code/main.py`, or use another language and document its setup and run command clearly in your README.
-
-Your solution must:
-
-- Read the input files from `dataset/`
-- Generate one prediction row for every request in `dataset/deletion_requests.csv`
-- Write the final predictions to `output.csv` in the repository root
-
-Run the starter Python entry point with:
+### Reproduce Full Evaluation Predictions (518 Cases)
+To run the deletion audit agent on the full challenge dataset and produce `./output.csv`:
 
 ```bash
-python3 code/main.py
+python code/main.py
 ```
 
-The blank template at `dataset/output.csv` is provided as a reference. Your final generated file for submission must be the root-level `output.csv`.
+Optional arguments:
+- `--input`: Path to input deletion requests CSV (default: `dataset/deletion_requests.csv`)
+- `--output`: Path to output CSV file (default: `output.csv`)
+- `--dataset-dir`: Path to repository dataset folder (default: `dataset`)
+
+Example custom run:
+```bash
+python code/main.py --input dataset/deletion_requests.csv --output output.csv
+```
+
+### Run Benchmark Verification
+To evaluate the agent on the 32 public sample requests against the official ground truth:
+
+```bash
+python code/main.py --input dataset/sample_deletion_requests.csv --output sample_predictions.csv
+python code/evaluation/verify_sample.py
+```
+
+### Validate Output Contract
+To verify that `./output.csv` conforms strictly to the challenge schema and contract:
+
+```bash
+python code/evaluation/verify_output_contract.py
+```
 
 
 ## Dataset
