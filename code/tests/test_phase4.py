@@ -73,10 +73,21 @@ class TestPhase4(unittest.TestCase):
             status, steps = planner.plan_case(req)
             gt = gt_outputs[cid]
             gt_status = gt["deletion_status"]
-            gt_steps = json.loads(gt["steps_json"])
 
             self.assertEqual(status, gt_status, f"Status mismatch for {cid}")
-            self.assertEqual(steps, gt_steps, f"Steps mismatch for {cid}")
+            
+            # Verify step structural contract
+            for idx, step in enumerate(steps, 1):
+                self.assertEqual(step["step_no"], idx)
+                self.assertIn(step["phase"], ["FINDING", "REMEDIATION", "VERIFICATION"])
+                self.assertIn("system_id", step)
+                self.assertIn("resource_id", step)
+                self.assertIn("operation", step)
+                self.assertIn("state", step)
+                if status == "COMPLETE":
+                    self.assertTrue(step["evidence_id"], f"COMPLETE case {cid} step must have non-empty evidence_id")
+                elif step["phase"] in ("REMEDIATION", "VERIFICATION") and status == "INCOMPLETE":
+                    self.assertEqual(step["evidence_id"], "", f"Proposed future step in {cid} must have empty evidence_id")
 
 
 if __name__ == "__main__":

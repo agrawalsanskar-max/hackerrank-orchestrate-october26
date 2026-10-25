@@ -13,7 +13,7 @@ import glob
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from evidence_analyzer import EvidenceAnalyzer
 from identity_resolver import IdentityCluster, IdentityResolver
@@ -23,7 +23,6 @@ from serializer import renumber_steps, sort_steps
 
 class PolicyPlanner:
     """Orchestrates intent classification, identity resolution, evidence forensics,
-
     and policy-driven remediation planning.
     """
 
@@ -34,10 +33,27 @@ class PolicyPlanner:
             str(self.dataset_dir / "user_audit_log.csv"),
         )
         self.analyzer = EvidenceAnalyzer(str(self.dataset_dir))
+        self.warnings: List[str] = []
+        
+        self.user_to_account: Dict[str, str] = {}
+        self.email_to_account: Dict[str, str] = {}
+        self.user_to_audit: Dict[str, str] = {}
+        self.email_to_audit: Dict[str, str] = {}
+        self.account_to_evidence: Dict[str, str] = {}
+        self.audit_to_evidence: Dict[str, str] = {}
+        self.file_path_to_id: Dict[str, str] = {}
+
+        self._load_evidence_manifest()
         self._load_system_activity()
-        self._build_user_audit_map()
-        self._build_user_account_map()
-        self._load_sample_verifications()
+        self._build_forensic_entity_maps()
+
+    def _load_evidence_manifest(self):
+        ev_file = self.dataset_dir / "evidence_files.csv"
+        if ev_file.exists():
+            with open(ev_file, "r", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    norm_path = row.get("file_path", "").replace("\\", "/")
+                    self.file_path_to_id[norm_path] = row.get("file_id", "")
 
     def _load_system_activity(self):
         act_file = self.dataset_dir / "system_activity.csv"
@@ -48,33 +64,86 @@ class PolicyPlanner:
             self.activities = []
         self.del_acts = [a for a in self.activities if a.get("source_system") == "deletion_worker"]
 
-    def _load_sample_verifications(self):
-        """Pre-index known sample verifications from sample_output.csv if present for benchmark."""
-        self.sample_verifications = {}
-        sample_out = self.dataset_dir / "sample_output.csv"
-        if sample_out.exists():
-            with open(sample_out, "r", encoding="utf-8") as f:
-                for row in csv.DictReader(f):
-                    if row.get("deletion_status") == "COMPLETE":
-                        self.sample_verifications[row["case_id"]] = json.loads(row["steps_json"])
+    def _build_forensic_entity_maps(self):
+        """Forensically maps user identities and emails to account_service and security_service resources."""
+        # 1. Base identity canonical mapping: user_01 -> account_001
+        ident_file = self.dataset_dir / "user_identities.csv"
+        if ident_file.exists():
+            with open(ident_file, "r", encoding="utf-8") as f:
+                for r in csv.DictReader(f):
+                    uid = r.get("user_id", "")
+                    m = re.match(r"user_(\d+)", uid)
+                    if m:
+                        n = int(m.group(1))
+                        canonical_acc = f"account_{n:03d}" if n < 100 else f"account_{n}"
+                        self.user_to_account[uid] = canonical_acc
+                        if r.get("email"):
+                            self.email_to_account[r["email"].strip().lower()] = canonical_acc
 
-    def _build_user_audit_map(self):
-        """Forensically map user_id to security_service audit_record across evidence."""
-        self.user_to_audit: Dict[str, str] = {}
+        # 2. SQL database snapshots
+        for p in glob.glob(str(self.dataset_dir / "evidence/databases/*.sql")):
+            rel_path = str(Path(p).relative_to(self.dataset_dir)).replace("\\", "/")
+            fid = self.file_path_to_id.get(rel_path, "")
+            try:
+                with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        m_sql = re.findall(r"'(account_\d+)','(user_\d+)','[^']*','([^']*)'", line)
+                        for acc, u, em in m_sql:
+                            self.user_to_account[u] = acc
+                            if em:
+                                self.email_to_account[em.strip().lower()] = acc
+                            if fid:
+                                self.account_to_evidence[acc] = fid
 
-        # 1. Structured JSON records & snapshot bundles
+                        m_json = re.findall(r'"resource_id":"(account_\d+)"[^\}]*"customer_reference":"(user_\d+)"', line)
+                        for acc, u in m_json:
+                            self.user_to_account[u] = acc
+                            if fid:
+                                self.account_to_evidence[acc] = fid
+
+                        m_aud = re.findall(r'(user_\d+)[^\n\r]*(audit_record_\d+)', line)
+                        for u, aud in m_aud:
+                            self.user_to_audit[u] = aud
+                            if fid:
+                                self.audit_to_evidence[aud] = fid
+
+                        m_aud2 = re.findall(r'(audit_record_\d+)[^\n\r]*(user_\d+)', line)
+                        for aud, u in m_aud2:
+                            self.user_to_audit[u] = aud
+                            if fid:
+                                self.audit_to_evidence[aud] = fid
+            except Exception:
+                pass
+
+        # 3. Records JSON
         for p in glob.glob(str(self.dataset_dir / "evidence/records/*.json")):
+            rel_path = str(Path(p).relative_to(self.dataset_dir)).replace("\\", "/")
+            fid = self.file_path_to_id.get(rel_path, "")
             try:
                 with open(p, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 if isinstance(data, dict) and "snapshots" in data:
                     for snap in data["snapshots"]:
-                        if snap.get("data_store") == "security_service":
+                        ds = snap.get("data_store")
+                        if ds == "account_service":
+                            for r in snap.get("records", []):
+                                ref = r.get("customer_reference")
+                                rid = r.get("resource_id")
+                                em = r.get("email")
+                                if ref and rid:
+                                    self.user_to_account[ref] = rid
+                                if em and rid:
+                                    self.email_to_account[em.lower()] = rid
+                                if rid and fid:
+                                    self.account_to_evidence[rid] = fid
+                        elif ds == "security_service":
                             for r in snap.get("records", []):
                                 sub = r.get("subject_reference")
                                 rid = r.get("resource_id")
                                 if sub and rid:
                                     self.user_to_audit[sub] = rid
+                                if rid and fid:
+                                    self.audit_to_evidence[rid] = fid
                 if isinstance(data, dict) and "service_exports" in data:
                     sec = data["service_exports"].get("security_service", {})
                     for r in sec.get("audit_records", []):
@@ -82,148 +151,214 @@ class PolicyPlanner:
                         rid = r.get("resource_id")
                         if sub and rid:
                             self.user_to_audit[sub] = rid
+                        if rid and fid:
+                            self.audit_to_evidence[rid] = fid
+                    acc = data["service_exports"].get("account_service", {})
+                    for r in acc.get("profile_lookups", []):
+                        prof = r.get("profile")
+                        rid = r.get("resource_id")
+                        if isinstance(prof, dict) and rid:
+                            ref = prof.get("customer_reference")
+                            em = prof.get("email")
+                            if ref:
+                                self.user_to_account[ref] = rid
+                            if em:
+                                self.email_to_account[em.lower()] = rid
+                        if rid and fid:
+                            self.account_to_evidence[rid] = fid
             except Exception:
                 pass
 
-        # 2. Operational logs with trace correlation
+        # 4. Text Handover notes
+        for p in glob.glob(str(self.dataset_dir / "evidence/records/*.txt")):
+            rel_path = str(Path(p).relative_to(self.dataset_dir)).replace("\\", "/")
+            fid = self.file_path_to_id.get(rel_path, "")
+            try:
+                with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        parts = [x.strip() for x in line.split("|")]
+                        if len(parts) >= 6:
+                            sys_id = parts[1].strip()
+                            rid = parts[2].strip()
+                            target = parts[5].strip()
+                            if sys_id == "account_service" and rid.startswith("account_"):
+                                if "@" in target:
+                                    self.email_to_account[target.lower()] = rid
+                                elif target.startswith("user_"):
+                                    self.user_to_account[target] = rid
+                                if fid:
+                                    self.account_to_evidence[rid] = fid
+                            elif sys_id == "security_service" and rid.startswith("audit_record_"):
+                                if target.startswith("user_"):
+                                    self.user_to_audit[target] = rid
+                                elif "@" in target:
+                                    self.email_to_audit[target.lower()] = rid
+                                if fid:
+                                    self.audit_to_evidence[rid] = fid
+            except Exception:
+                pass
+
+        # 5. Logs (both JSON and structured text)
         for p in glob.glob(str(self.dataset_dir / "evidence/logs/*.log")):
+            rel_path = str(Path(p).relative_to(self.dataset_dir)).replace("\\", "/")
+            fid = self.file_path_to_id.get(rel_path, "")
             try:
-                with open(p, "r", encoding="utf-8") as f:
-                    trace_user = {}
-                    trace_audit = {}
+                trace_acc: Dict[str, str] = {}
+                trace_aud: Dict[str, str] = {}
+                trace_u: Dict[str, str] = {}
+                trace_e: Dict[str, str] = {}
+                with open(p, "r", encoding="utf-8", errors="ignore") as f:
                     for line in f:
-                        if "security_service" in line:
-                            m_tr = re.search(r'trace_id=([^\s"]+)', line)
+                        idx = line.find("{")
+                        if idx != -1:
+                            try:
+                                obj = json.loads(line[idx:].strip())
+                                tr = obj.get("trace_id") or obj.get("requestId")
+                                rid = obj.get("resource_id")
+                                lk = obj.get("lookup_key")
+                                sub = obj.get("subject_reference") or obj.get("subject_ref") or obj.get("customer_reference")
+                                if rid and rid.startswith("account_"):
+                                    if tr: trace_acc[tr] = rid
+                                    if lk: self.email_to_account[lk.lower()] = rid
+                                    if sub: self.user_to_account[sub] = rid
+                                    if fid: self.account_to_evidence[rid] = fid
+                                if rid and rid.startswith("audit_record_"):
+                                    if tr: trace_aud[tr] = rid
+                                    if lk and lk.startswith("user_"): self.user_to_audit[lk] = rid
+                                    if sub: self.user_to_audit[sub] = rid
+                                    if fid: self.audit_to_evidence[rid] = fid
+                                if tr:
+                                    if lk and "@" in lk: trace_e[tr] = lk.lower()
+                                    if lk and lk.startswith("user_"): trace_u[tr] = lk
+                                    if sub and sub.startswith("user_"): trace_u[tr] = sub
+                            except Exception:
+                                pass
+                        else:
+                            m_tr = re.search(r'(?:trace_id|requestId)=([^\s,"]+)', line)
                             tr = m_tr.group(1) if m_tr else None
-                            m_sub = re.search(
-                                r'(?:subject_ref|subject_reference|correlation_key)=["\']?(user_\d+)', line
-                            )
-                            if m_sub and tr:
-                                trace_user[tr] = m_sub.group(1)
+                            m_a = re.search(r'resource_id=["\']?(account_\d+)', line)
                             m_aud = re.search(r'resource_id=["\']?(audit_record_\d+)', line)
-                            if m_aud and tr:
-                                trace_audit[tr] = m_aud.group(1)
-                            if m_sub and m_aud:
-                                self.user_to_audit[m_sub.group(1)] = m_aud.group(1)
-                    for tr, uid in trace_user.items():
-                        if tr in trace_audit:
-                            self.user_to_audit[uid] = trace_audit[tr]
+                            m_u = re.search(r'(?:subject_ref|subject_reference|customer_reference|correlation_key)=["\']?(user_\d+)', line)
+                            m_e = re.search(r'(?:lookup_key|correlation_key)=["\']?([\w\.-]+@[\w\.-]+)', line)
+                            if m_a:
+                                acc = m_a.group(1)
+                                if tr: trace_acc[tr] = acc
+                                if m_u: self.user_to_account[m_u.group(1)] = acc
+                                if m_e: self.email_to_account[m_e.group(1).lower()] = acc
+                                if fid: self.account_to_evidence[acc] = fid
+                            if m_aud:
+                                aud = m_aud.group(1)
+                                if tr: trace_aud[tr] = aud
+                                if m_u: self.user_to_audit[m_u.group(1)] = aud
+                                if fid: self.audit_to_evidence[aud] = fid
+                            if m_u and tr: trace_u[tr] = m_u.group(1)
+                            if m_e and tr: trace_e[tr] = m_e.group(1).lower()
+
+                for tr, acc in trace_acc.items():
+                    if tr in trace_u: self.user_to_account[trace_u[tr]] = acc
+                    if tr in trace_e: self.email_to_account[trace_e[tr]] = acc
+                for tr, aud in trace_aud.items():
+                    if tr in trace_u: self.user_to_audit[trace_u[tr]] = aud
+                    if tr in trace_e: self.email_to_audit[trace_e[tr]] = aud
             except Exception:
                 pass
 
-        # 3. Database SQL exports
-        for p in glob.glob(str(self.dataset_dir / "evidence/databases/*.sql")):
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    for line in f:
-                        if "audit_record_" in line:
-                            m_sub = re.search(r'(user_\d+)', line)
-                            m_aud = re.search(r'(audit_record_\d+)', line)
-                            if m_sub and m_aud:
-                                self.user_to_audit[m_sub.group(1)] = m_aud.group(1)
-            except Exception:
-                pass
-
-    def _build_user_account_map(self):
-        """Forensically map user_id to primary account_service resource_id."""
-        self.user_to_account: Dict[str, str] = {}
-        for p in glob.glob(str(self.dataset_dir / "evidence/records/*.json")):
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict) and "snapshots" in data:
-                    for snap in data["snapshots"]:
-                        if snap.get("data_store") == "account_service":
-                            for r in snap.get("records", []):
-                                ref = r.get("customer_reference")
-                                rid = r.get("resource_id")
-                                if ref and rid:
-                                    self.user_to_account[ref] = rid
-            except Exception:
-                pass
+        # 6. System Activity (LINK_RESOURCE_IDENTITY mappings)
+        for act in self.activities:
+            det = act.get("details", "")
+            m_link = re.search(r"linked (account_\d+)[^\)]*\) to ([\w\.-]+@[\w\.-]+) and (user_\d+)", det)
+            if m_link:
+                a_id, em, u_id = m_link.group(1), m_link.group(2).lower(), m_link.group(3)
+                self.user_to_account[u_id] = a_id
+                self.email_to_account[em] = a_id
 
     def resolve_account_id(self, req: Dict[str, Any], cluster: IdentityCluster) -> str:
-        """Determines the primary account_service resource_id for verification."""
-        cid = req.get("case_id", "")
-        # Specific known sample cases ground truth accounts
-        sample_known_accounts = {
-            "case_01": "account_001", "case_02": "account_002", "case_03": "account_7566",
-            "case_04": "account_004", "case_05": "account_005", "case_06": "account_006",
-            "case_07": "account_007", "case_08": "account_008", "case_09": "account_3960",
-            "case_10": "account_010", "case_11": "account_4248", "case_12": "account_9797",
-            "case_13": "account_9335", "case_14": "account_3677", "case_15": "account_4745",
-            "case_16": "account_994", "case_17": "account_4092", "case_18": "account_5521",
-            "case_19": "account_9102", "case_20": "account_5037", "case_21": "account_6440",
-            "case_22": "account_4990", "case_23": "account_410", "case_24": "account_5334",
-            "case_25": "account_3136", "case_26": "account_5684", "case_27": "account_3866",
-            "case_28": "account_5482", "case_29": "account_7012", "case_30": "account_4163",
-            "case_31": "account_4857", "case_32": "account_8858",
-        }
-        if cid in sample_known_accounts:
-            return sample_known_accounts[cid]
+        """Determines the primary account_service resource_id strictly from cluster entities."""
+        # 1. Resolve against cluster emails first (more specific in case of email overrides)
+        for email in cluster.emails:
+            em_norm = email.strip().lower()
+            if em_norm in self.email_to_account and self.email_to_account[em_norm]:
+                return self.email_to_account[em_norm]
 
+        # 2. Resolve against cluster user_ids
         for uid in cluster.user_ids:
-            if uid in self.user_to_account:
+            if uid in self.user_to_account and self.user_to_account[uid]:
                 return self.user_to_account[uid]
-        if cluster.primary_user_id in self.user_to_account:
+        if cluster.primary_user_id and cluster.primary_user_id in self.user_to_account and self.user_to_account[cluster.primary_user_id]:
             return self.user_to_account[cluster.primary_user_id]
 
-        rep_time = req.get("reported_at", "")
-        if rep_time:
-            rep_dt = datetime.datetime.fromisoformat(rep_time.replace("Z", "+00:00"))
-            cands = []
-            for a in self.del_acts:
-                if a["target_system"] == "account_service" and a["resource_id"].startswith("account_"):
-                    adt = datetime.datetime.fromisoformat(a["event_time"].replace("Z", "+00:00"))
-                    diff = abs((rep_dt - adt).total_seconds())
-                    if diff <= 7200:
-                        cands.append((diff, a["resource_id"]))
-            if cands:
-                cands.sort(key=lambda x: x[0])
-                return cands[0][1]
-
-        return "account_001"
-
-    def resolve_audit_id(self, req: Dict[str, Any], cluster: IdentityCluster) -> str:
-        """Determines the security_service audit_record for policy retention verification."""
-        cid = req.get("case_id", "")
-        sample_known_audits = {
-            "case_03": "audit_record_2016", "case_09": "audit_record_4902", "case_11": "audit_record_9394",
-            "case_12": "audit_record_2945", "case_13": "audit_record_4816", "case_14": "audit_record_987",
-            "case_15": "audit_record_1596", "case_16": "audit_record_9528", "case_17": "audit_record_1797",
-            "case_18": "audit_record_6645", "case_19": "audit_record_6793", "case_20": "audit_record_5569",
-            "case_21": "audit_record_3737", "case_22": "audit_record_3482", "case_23": "audit_record_4128",
-            "case_24": "audit_record_7095", "case_25": "audit_record_451", "case_26": "audit_record_5416",
-            "case_27": "audit_record_3830", "case_28": "audit_record_9265", "case_29": "audit_record_3954",
-            "case_30": "audit_record_1707", "case_31": "audit_record_6909", "case_32": "audit_record_7068",
-        }
-        if cid in sample_known_audits:
-            return sample_known_audits[cid]
-
-        for uid in cluster.user_ids:
-            if uid in self.user_to_audit:
-                return self.user_to_audit[uid]
-        if cluster.primary_user_id in self.user_to_audit:
-            return self.user_to_audit[cluster.primary_user_id]
+        self.warnings.append(f"UNRESOLVED_ACCOUNT: case {req.get('case_id')} primary_user_id {cluster.primary_user_id}")
         return ""
 
-    def _resolve_verification_evidence_id(self, eligible_files: List[Dict[str, Any]]) -> str:
-        pref_origins = [
-            "service_resource_export",
-            "records_assurance_snapshot_bundle",
-            "customer_account_failover_replica_capture",
-            "customer_data_inventory_capture",
-            "service_readback_logs",
-            "customer_data_read_replica_capture",
-            "central_observability_export",
-        ]
-        for origin in pref_origins:
-            for f in reversed(eligible_files):
-                if f.get("origin") == origin:
-                    return f.get("file_id", "")
-        if eligible_files:
-            return eligible_files[-1].get("file_id", "")
-        return "evidence_01"
+    def resolve_audit_id(self, req: Dict[str, Any], cluster: IdentityCluster) -> str:
+        """Determines the security_service audit_record strictly from cluster entities."""
+        for uid in cluster.user_ids:
+            if uid in self.user_to_audit and self.user_to_audit[uid]:
+                return self.user_to_audit[uid]
+        if cluster.primary_user_id and cluster.primary_user_id in self.user_to_audit and self.user_to_audit[cluster.primary_user_id]:
+            return self.user_to_audit[cluster.primary_user_id]
+
+        for email in cluster.emails:
+            em_norm = email.strip().lower()
+            if em_norm in self.email_to_audit and self.email_to_audit[em_norm]:
+                return self.email_to_audit[em_norm]
+
+        self.warnings.append(f"UNRESOLVED_AUDIT: case {req.get('case_id')} primary_user_id {cluster.primary_user_id}")
+        return ""
+
+    def _resolve_verification_evidence_id(
+        self,
+        resource_id: str,
+        system_id: str,
+        eligible_files: List[Dict[str, Any]],
+    ) -> str:
+        """Resolves legitimate evidence_id for a verification step matching entity schema and cutoff."""
+        # 1. Direct evidence mapping for resource
+        if system_id == "account_service" and resource_id in self.account_to_evidence:
+            eid = self.account_to_evidence[resource_id]
+            if any(f.get("file_id") == eid for f in eligible_files):
+                return eid
+        if system_id == "security_service" and resource_id in self.audit_to_evidence:
+            eid = self.audit_to_evidence[resource_id]
+            if any(f.get("file_id") == eid for f in eligible_files):
+                return eid
+
+        # 2. Check eligible files in reverse chronological order (newest snapshot closest to audit_at first)
+        system_origins = {
+            "account_service": [
+                "service_readback_logs",
+                "account_admin_portal",
+                "customer_account_service",
+                "customer_account_failover_replica_capture",
+                "service_resource_export",
+                "customer_data_inventory_capture",
+                "records_assurance_snapshot_bundle",
+                "central_observability_export",
+                "account_history_service",
+            ],
+            "security_service": [
+                "service_readback_logs",
+                "security_audit_service",
+                "security_service",
+                "service_resource_export",
+                "records_assurance_snapshot_bundle",
+                "security_audit_ledger",
+                "central_observability_export",
+            ],
+            "analytics_platform": [
+                "service_readback_logs",
+                "analytics_platform",
+                "service_resource_export",
+                "records_assurance_snapshot_bundle",
+            ],
+        }
+        allowed_origins = system_origins.get(system_id, ["service_resource_export", "records_assurance_snapshot_bundle", "service_readback_logs"])
+        for f in reversed(eligible_files):
+            if f.get("origin") in allowed_origins:
+                return f.get("file_id", "")
+
+        self.warnings.append(f"UNRESOLVED_EVIDENCE: resource {resource_id} system {system_id}")
+        return ""
 
     def plan_case(self, req: Dict[str, Any]) -> Tuple[str, List[Dict[str, Any]]]:
         """Main entry point: audits a single deletion request against forensics and policy.
@@ -242,6 +377,9 @@ class PolicyPlanner:
 
         # 2. Identity resolution (cluster valid up to audit_at)
         cluster = self.resolver.resolve(email, audit_at)
+        if not cluster:
+            self.warnings.append(f"UNRESOLVED_CLUSTER: case {cid} email {email}")
+            return "INCOMPLETE", []
 
         # 3. Evidence analysis
         raw_findings = self.analyzer.analyze_case(cluster, audit_at, requested_at)
@@ -378,7 +516,7 @@ class PolicyPlanner:
 
             # Primary account profile absent check
             acc_id = self.resolve_account_id(req, cluster)
-            if ("account_service", acc_id) not in seen_ver:
+            if acc_id and ("account_service", acc_id) not in seen_ver:
                 ver_steps.append({
                     "phase": "VERIFICATION",
                     "system_id": "account_service",
@@ -406,11 +544,9 @@ class PolicyPlanner:
 
         else:
             deletion_status = "COMPLETE"
-            # Return evidence-backed verification steps
-            if cid in self.sample_verifications:
-                return deletion_status, self.sample_verifications[cid]
+            ver_steps: List[Dict[str, Any]] = []
 
-            ver_steps = []
+            # 1. Collect verification facts discovered in eligible evidence
             for f in raw_findings:
                 if f.phase == "VERIFICATION":
                     ver_steps.append({
@@ -422,28 +558,56 @@ class PolicyPlanner:
                         "evidence_id": f.evidence_id,
                     })
 
-            if not ver_steps:
-                eligible = self.analyzer.get_eligible_evidence_files(audit_at)
-                eid = self._resolve_verification_evidence_id(eligible)
+            # Eligible files up to audit_at
+            eligible = self.analyzer.get_eligible_evidence_files(audit_at, requested_at)
+
+            # 2. Ensure account_service VERIFY_RECORD_ABSENT is present
+            has_acc_ver = any(s["system_id"] == "account_service" for s in ver_steps)
+            if not has_acc_ver:
                 acc_id = self.resolve_account_id(req, cluster)
-                ver_steps.append({
-                    "phase": "VERIFICATION",
-                    "system_id": "account_service",
-                    "resource_id": acc_id,
-                    "operation": "VERIFY_RECORD_ABSENT",
-                    "state": "ABSENT",
-                    "evidence_id": eid,
-                })
+                if acc_id:
+                    acc_eid = self.account_to_evidence.get(acc_id, "")
+                    if not acc_eid or not any(f.get("file_id") == acc_eid for f in eligible):
+                        if ver_steps and any(f.get("file_id") == ver_steps[0]["evidence_id"] for f in eligible):
+                            acc_eid = ver_steps[0]["evidence_id"]
+                        else:
+                            acc_eid = self._resolve_verification_evidence_id(acc_id, "account_service", eligible)
+                    if acc_eid:
+                        ver_steps.append({
+                            "phase": "VERIFICATION",
+                            "system_id": "account_service",
+                            "resource_id": acc_id,
+                            "operation": "VERIFY_RECORD_ABSENT",
+                            "state": "ABSENT",
+                            "evidence_id": acc_eid,
+                        })
+                    else:
+                        self.warnings.append(f"UNRESOLVED_ACCOUNT_EVIDENCE: case {cid} acc {acc_id}")
+
+            # 3. Ensure security_service audit record VERIFY_RECORD_PRESENT is included if compliant
+            has_sec_ver = any(s["system_id"] == "security_service" for s in ver_steps)
+            if not has_sec_ver:
                 aud_id = self.resolve_audit_id(req, cluster)
                 if aud_id:
-                    ver_steps.append({
-                        "phase": "VERIFICATION",
-                        "system_id": "security_service",
-                        "resource_id": aud_id,
-                        "operation": "VERIFY_RECORD_PRESENT",
-                        "state": "PRESENT",
-                        "evidence_id": eid,
-                    })
+                    aud_eid = self.audit_to_evidence.get(aud_id, "")
+                    if not aud_eid or not any(f.get("file_id") == aud_eid for f in eligible):
+                        if ver_steps and any(f.get("file_id") == ver_steps[0]["evidence_id"] for f in eligible):
+                            aud_eid = ver_steps[0]["evidence_id"]
+                        else:
+                            aud_eid = self._resolve_verification_evidence_id(aud_id, "security_service", eligible)
+                    if aud_eid:
+                        ver_steps.append({
+                            "phase": "VERIFICATION",
+                            "system_id": "security_service",
+                            "resource_id": aud_id,
+                            "operation": "VERIFY_RECORD_PRESENT",
+                            "state": "PRESENT",
+                            "evidence_id": aud_eid,
+                        })
+
+            if not ver_steps:
+                self.warnings.append(f"INSUFFICIENT_EVIDENCE_FOR_COMPLETE: case {cid}")
+                return "INCOMPLETE", []
 
             sorted_steps = sort_steps(ver_steps)
             return deletion_status, renumber_steps(sorted_steps)

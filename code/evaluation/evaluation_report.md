@@ -126,41 +126,40 @@ A total of **2,207 steps** were generated across all cases:
 To thoroughly test boundary conditions and edge cases beyond the training distribution, we engineered and validated three synthetic forensic cases.
 
 ### Synthetic Case 1: Cross-Region Replica Drift
-- **Scenario**: A European customer (`user_8112`, `elena.rostova@berlin-tech.de`) submits a GDPR Article 17 erasure request. The primary `customer_profiles_primary` database table in `eu-west-1` executes a purge, and the workflow reports `COMPLETE`. However, an asynchronous cross-region read replica `customer_profiles_read_replica` in `ap-southeast-1` failed replication due to network partition during maintenance.
-- **Observable Evidence**: `evidence_99.sql` (captured at `2026-10-14T04:00:00Z`, before `audit_at`) contains an intact row for `account_8112` with unmasked email and phone number.
+- **Scenario**: A customer (`user_05`, `leila.haddad@yahoo.com`) submits a deletion request. The primary account service executes a purge and the deletion workflow claims `COMPLETE`. However, an asynchronous failover database replica captures an unpurged account record.
+- **Observable Evidence**: `evidence_54` (`customer_accounts_failover_replica_20260902.sql`, captured before `audit_at`) contains an intact row for `account_005` in `customer_profiles_failover_replica` with unmasked email and phone number.
 - **Expected Status**: `INCOMPLETE`
 - **Expected Steps**:
-  1. `FINDING`: `REPORT_REMAINING_RECORD` on `account_service` / `account_8112`, state `PRESENT`, evidence `evidence_99`.
-  2. `REMEDIATION`: `DELETE_RECORD` on `account_service` / `account_8112`, state `ABSENT`, evidence `""`.
-  3. `VERIFICATION`: `VERIFY_RECORD_ABSENT` on `account_service` / `account_8112`, state `ABSENT`, evidence `""`.
-  4. `VERIFICATION`: `VERIFY_RECORD_PRESENT` on `security_service` / `audit_record_8112`, state `PRESENT`, evidence `""`.
+  1. `FINDING`: `REPORT_REMAINING_RECORD` on `account_service` / `account_005`, state `PRESENT`, evidence `evidence_54`.
+  2. `REMEDIATION`: `DELETE_RECORD` on `account_service` / `account_005`, state `ABSENT`, evidence `""`.
+  3. `VERIFICATION`: `VERIFY_RECORD_ABSENT` on `account_service` / `account_005`, state `ABSENT`, evidence `""`.
+  4. `VERIFICATION`: `VERIFY_RECORD_PRESENT` on `security_service` / `audit_record_005`, state `PRESENT`, evidence `""`.
 
-### Synthetic Case 2: Tombstone Identity Leak
-- **Scenario**: A customer with an active account deletion (`user_9402`, `marcus.vance@techcorp.io`) is processed under an `ACCOUNT_TOMBSTONE` policy. Under `deletion_rules.csv`, the internal subject reference `user_9402` and account reference `tombstone_9402` may be retained to preserve relational integrity for historical financial transactions, but all direct identifiers (full name, email, phone number) must be redacted.
-- **Observable Evidence**: `evidence_104.json` contains `tombstone_9402` where the name and email were removed, but the raw mobile phone number `+1-555-019-9402` was left unredacted in the metadata payload.
+### Synthetic Case 2: Support Message PII Retention
+- **Scenario**: A customer deletion request is processed, but customer communication tickets under `support_platform` are retained under Rule 5 of `deletion_rules.csv` ("Conversation contains shared customer, agent, or order context that must be retained"). Under policy, the record may be retained, but all direct customer identifiers must be redacted.
+- **Observable Evidence**: `evidence_92` (`service_resource_export_20260915_114455.json`) contains support ticket `support_6477` where direct PII (requester email and phone) remains unredacted in the ticket metadata.
 - **Expected Status**: `INCOMPLETE`
 - **Expected Steps**:
-  1. `FINDING`: `REPORT_EXPOSED_PII` on `identity_service` / `tombstone_9402`, state `PRESENT`, evidence `evidence_104`.
-  2. `REMEDIATION`: `REDACT_RECORD` on `identity_service` / `tombstone_9402`, state `REDACTED`, evidence `""`.
-  3. `VERIFICATION`: `VERIFY_RECORD_ABSENT` on `account_service` / `account_9402`, state `ABSENT`, evidence `""`.
-  4. `VERIFICATION`: `VERIFY_RECORD_REDACTED` on `identity_service` / `tombstone_9402`, state `REDACTED`, evidence `""`.
-  5. `VERIFICATION`: `VERIFY_RECORD_PRESENT` on `security_service` / `audit_record_9402`, state `PRESENT`, evidence `""`.
+  1. `FINDING`: `REPORT_EXPOSED_PII` on `support_platform` / `support_6477`, state `PRESENT`, evidence `evidence_92`.
+  2. `REMEDIATION`: `REDACT_RECORD` on `support_platform` / `support_6477`, state `REDACTED`, evidence `""`.
+  3. `VERIFICATION`: `VERIFY_RECORD_ABSENT` on `account_service` / `account_4163`, state `ABSENT`, evidence `""`.
+  4. `VERIFICATION`: `VERIFY_RECORD_REDACTED` on `support_platform` / `support_6477`, state `REDACTED`, evidence `""`.
+  5. `VERIFICATION`: `VERIFY_RECORD_PRESENT` on `security_service` / `audit_record_1707`, state `PRESENT`, evidence `""`.
 
 ### Synthetic Case 3: Automated Sync & Backup Restore Collision
-- **Scenario**: An account (`user_4150`, `chloe.dupont@paris-retail.fr`) is deleted from live production services. However, an automated daily database restoration routine (`backup_service` / `backup_4150`) runs to refresh the staging environment from an unpurged snapshot. Simultaneously, an external CRM connector (`integration_service` / `data_flow_4150`) actively synchronizes users from staging back into customer analytics.
+- **Scenario**: A customer account is purged from live services, but an automated backup archive restoration routine remains unblocked (`backup_service` / `backup_3870`), and an active CRM data connector (`integration_service` / `data_flow_8524`) continues periodic synchronization capable of recreating user data.
 - **Observable Evidence**:
-  - `evidence_112.json`: Active integration job `data_flow_4150` targeting user cluster.
-  - `evidence_115.log`: Restore schedule `backup_4150` unblocked.
+  - `evidence_92` (`service_resource_export_20260915_114455.json`): Active connector `data_flow_8524` with `enabled=True`.
+  - `evidence_93` (`structured_service_events_eu_west_20260918.log`): Unblocked restore candidate `backup_3870`.
 - **Expected Status**: `INCOMPLETE`
 - **Expected Steps**:
-  1. `FINDING`: `REPORT_ACTIVE_DATA_FLOW` on `integration_service` / `data_flow_4150`, state `ACTIVE`, evidence `evidence_112`.
-  2. `FINDING`: `REPORT_RESTORE_RISK` on `backup_service` / `backup_4150`, state `ACTIVE`, evidence `evidence_115`.
-  3. `REMEDIATION`: `DISABLE_DATA_FLOW` on `integration_service` / `data_flow_4150`, state `DISABLED`, evidence `""`.
-  4. `REMEDIATION`: `BLOCK_RESTORE` on `backup_service` / `backup_4150`, state `BLOCKED`, evidence `""`.
-  5. `VERIFICATION`: `VERIFY_DATA_FLOW_DISABLED` on `integration_service` / `data_flow_4150`, state `DISABLED`, evidence `""`.
-  6. `VERIFICATION`: `VERIFY_RESTORE_BLOCKED` on `backup_service` / `backup_4150`, state `BLOCKED`, evidence `""`.
-  7. `VERIFICATION`: `VERIFY_RECORD_ABSENT` on `account_service` / `account_4150`, state `ABSENT`, evidence `""`.
-  8. `VERIFICATION`: `VERIFY_RECORD_PRESENT` on `security_service` / `audit_record_4150`, state `PRESENT`, evidence `""`.
+  1. `FINDING`: `REPORT_ACTIVE_DATA_FLOW` on `integration_service` / `data_flow_8524`, state `ACTIVE`, evidence `evidence_92`.
+  2. `FINDING`: `REPORT_RESTORE_RISK` on `backup_service` / `backup_3870`, state `ACTIVE`, evidence `evidence_93`.
+  3. `REMEDIATION`: `DISABLE_DATA_FLOW` on `integration_service` / `data_flow_8524`, state `DISABLED`, evidence `""`.
+  4. `REMEDIATION`: `BLOCK_RESTORE` on `backup_service` / `backup_3870`, state `BLOCKED`, evidence `""`.
+  5. `VERIFICATION`: `VERIFY_RECORD_ABSENT` on `account_service` / `account_4163`, state `ABSENT`, evidence `""`.
+  6. `VERIFICATION`: `VERIFY_DATA_FLOW_DISABLED` on `integration_service` / `data_flow_8524`, state `DISABLED`, evidence `""`.
+  7. `VERIFICATION`: `VERIFY_RESTORE_BLOCKED` on `backup_service` / `backup_3870`, state `BLOCKED`, evidence `""`.
 
 ---
 

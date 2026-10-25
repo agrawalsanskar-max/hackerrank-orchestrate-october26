@@ -742,11 +742,21 @@ class EvidenceAnalyzer:
             standalone_events: List[Dict[str, str]] = []
 
             for line in lines:
-                matches = re.findall(r'(\w+)=(?:"([^"]*)"|(\S+))', line)
-                props = {k: (v_quoted if v_quoted else v_unquoted) for k, v_quoted, v_unquoted in matches}
-                line_lower = line.lower()
+                props = {}
+                idx = line.find("{")
+                if idx != -1:
+                    try:
+                        raw_obj = json.loads(line[idx:].strip())
+                        if isinstance(raw_obj, dict):
+                            props = {str(k): (str(v) if v is not None else "") for k, v in raw_obj.items()}
+                    except Exception:
+                        pass
+                if not props:
+                    matches = re.findall(r'(\w+)=(?:"([^"]*)"|(\S+))', line)
+                    props = {k: (v_quoted if v_quoted else v_unquoted) for k, v_quoted, v_unquoted in matches}
 
-                trace_id = props.get("trace_id", "")
+                line_lower = line.lower()
+                trace_id = props.get("trace_id") or props.get("requestId", "")
                 is_matched = any(term.lower() in line_lower for term in all_terms)
 
                 if trace_id:
@@ -765,7 +775,7 @@ class EvidenceAnalyzer:
             seen_resources = set()
             for props in target_events:
                 r_id = props.get("resource_id", "")
-                service = props.get("service", "")
+                service = props.get("service") or props.get("logger", "")
                 event = props.get("event", "")
 
                 if not r_id or r_id in seen_resources:
@@ -776,7 +786,27 @@ class EvidenceAnalyzer:
 
                 seen_resources.add(r_id)
 
-                if event == "index_query_completed" and props.get("result") == "hit":
+                if service == "account_service" and (props.get("http_status") == "404" or str(props.get("rows")) == "0"):
+                    findings.append(EvidenceFinding(
+                        system_id="account_service",
+                        resource_id=r_id,
+                        phase="VERIFICATION",
+                        operation="VERIFY_RECORD_ABSENT",
+                        state="ABSENT",
+                        evidence_id=file_id,
+                    ))
+
+                elif service == "account_service" and (props.get("http_status") == "200" or str(props.get("rows")) in ("1", "true")):
+                    findings.append(EvidenceFinding(
+                        system_id="account_service",
+                        resource_id=r_id,
+                        phase="FINDING",
+                        operation="REPORT_REMAINING_RECORD",
+                        state="PRESENT",
+                        evidence_id=file_id,
+                    ))
+
+                elif event == "index_query_completed" and props.get("result") == "hit":
                     findings.append(EvidenceFinding(
                         system_id="search_service",
                         resource_id=r_id,

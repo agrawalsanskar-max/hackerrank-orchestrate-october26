@@ -12,10 +12,15 @@ Read [`problem_statement.md`](./problem_statement.md) for the complete challenge
 
 ---
 
-## Quick Start & Reproduction
+## Quick Start
 
-### Prerequisites
-- Python 3.10+ (Standard library only; zero external pip dependencies required).
+Standard library only (no external pip dependencies required). Input dataset expected at `dataset/`, entry point at `python code/main.py`.
+
+```bash
+# Quick Start (Standard library only; no external pip dependencies required)
+# Input dataset expected at dataset/
+python code/main.py
+```
 
 ### Reproduce Full Evaluation Predictions (518 Cases)
 To run the deletion audit agent on the full challenge dataset and produce `./output.csv`:
